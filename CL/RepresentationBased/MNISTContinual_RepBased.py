@@ -129,16 +129,35 @@ class RepresentationBasedModel(nn.Module):
         print(f"✅ Added head for Task {task_num}")
         
     def freeze_shared_encoder(self):
-        """Freeze shared encoder to protect learned representations"""
+        """
+        Freeze shared encoder to protect learned representations.
+        
+        What this means:
+        - Architecture: Already fixed (defined in __init__)
+        - Weights: NOW FROZEN (param.requires_grad = False)
+        
+        After this call:
+        - Encoder structure stays the same (no architecture change)
+        - Encoder weights cannot be updated (frozen parameters)
+        - Only task heads can be trained
+        """
         for param in self.shared_encoder.parameters():
-            param.requires_grad = False
-        print(f"🔒 Shared encoder FROZEN - representations are protected!")
+            param.requires_grad = False  # WEIGHTS frozen, not just architecture
+        print(f"🔒 Shared encoder FROZEN - weights are now non-trainable (architecture was already fixed)!")
         
     def unfreeze_shared_encoder(self):
-        """Unfreeze shared encoder (for initial task training)"""
+        """
+        Unfreeze shared encoder (for initial task training).
+        
+        What this means:
+        - Architecture: Fixed (no change)
+        - Weights: NOW TRAINABLE (param.requires_grad = True)
+        
+        This allows the encoder weights to be updated during Task 1 training.
+        """
         for param in self.shared_encoder.parameters():
-            param.requires_grad = True
-        print(f"🔓 Shared encoder UNFROZEN - learning representations!")
+            param.requires_grad = True  # WEIGHTS trainable
+        print(f"🔓 Shared encoder UNFROZEN - weights are now trainable!")
     
     def forward(self, x, task_num=None):
         """
@@ -336,6 +355,10 @@ task_representations = {}
 print(f"\n🔧 Representation-Based Parameters:")
 print(f"   Task 1: Train encoder + head (learn shared representations)")
 print(f"   Task 2+: Freeze encoder, train task-specific heads only")
+print(f"\n⚠️  IMPORTANT ASSUMPTION:")
+print(f"   This approach assumes Task 1 encoder learns GENERAL features useful for all tasks.")
+print(f"   This works well when tasks are similar (e.g., all MNIST digit classification).")
+print(f"   For very different tasks, consider multi-task pretraining first!")
 
 # Train on all 5 tasks sequentially
 for task_num in range(1, 6):
@@ -427,6 +450,11 @@ print(f"1. Shared encoder learns common features in Task 1")
 print(f"2. Encoder is frozen after Task 1 to protect representations")
 print(f"3. Each new task gets its own head, but reuses the frozen encoder")
 print(f"4. This prevents interference because encoder parameters don't change")
+print(f"\n⚠️  LIMITATION:")
+print(f"   This assumes Task 1 features generalize to all future tasks.")
+print(f"   For MNIST (all digit classification), this works well.")
+print(f"   For very different tasks, encoder may be suboptimal for later tasks.")
+print(f"   Solution: Multi-task pretrain encoder on Tasks 1-3 before freezing!")
 
 # ========================================
 # 📈 VISUALIZATION

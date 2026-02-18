@@ -26,7 +26,6 @@ event_indices_pf: list = []
 event_accuracies_pf: list = []
 event_losses_pf: list = []
 
-
 # ----- Data Preparation (EMNIST) -----
 # We use the "balanced" split (contains digits and letters).
 transform = transforms.Compose([
@@ -263,7 +262,6 @@ class FedFaServer:
         self.buffer = deque(maxlen=buffer_size)  # this is S in the pseudocode
         self.buffer_size = buffer_size
 
-
     def apply_fedfa_update(self, client_params, client_id: int):
         """
         Enqueue the client's local model parameters.
@@ -388,116 +386,6 @@ class FedFaServerParticipationFair:
             new_global[name] = acc
 
         # Update stored global params and the actual model
-        self.global_params = {name: p.clone() for name, p in new_global.items()}
-        self.global_version += 1
-
-        with torch.no_grad():
-            for name, param in self.global_model.named_parameters():
-                param.data.copy_(self.global_params[name].to(DEVICE))
-
-
-class FedFaServerValAware:
-    """
-    FedFa-style server with label-distribution-aware weighting:
-      - Maintains a sliding window buffer S of size K = buffer_size
-      - At most one entry per client in the buffer (latest model)
-      - When the buffer is full, sets the global model to a
-        label-aware weighted average of the models in the buffer,
-        where each client i has a precomputed score reflecting how
-        "rare" its labels are globally.
-    """
-
-    def __init__(self, global_model, buffer_size: int, val_loader, alpha: float = 5.0, max_val_batches: int = 3):
-        self.global_model = global_model
-        self.global_params = {name: p.data.clone().cpu() for name, p in global_model.named_parameters()}
-        self.global_version = 0
-        self.buffer = deque(maxlen=buffer_size)
-        self.buffer_size = buffer_size
-        self.val_loader = val_loader
-        self.alpha = alpha
-        # Limit how many batches we use from the validation loader
-        # for each model in the buffer to keep things fast.
-        self.max_val_batches = max_val_batches
-
-    def apply_fedfa_update(self, client_params, client_id: int):
-        """
-        Enqueue/replace the client's local model parameters.
-        When the buffer is full (size K), set global model to a
-        validation-loss-aware weighted average of all models currently in the buffer.
-        """
-        entry = {
-            "params": {name: p.clone() for name, p in client_params.items()},
-            "client_id": client_id,
-        }
-
-        # Ensure at most one entry per client in the buffer: replace if exists
-        existing_index = None
-        for i, e in enumerate(self.buffer):
-            if e["client_id"] == client_id:
-                existing_index = i
-                break
-
-        if existing_index is not None:
-            self.buffer[existing_index] = entry
-            print(f"   Replaced existing entry for client {client_id} (ValAware-FedFa)")
-        else:
-            self.buffer.append(entry)
-
-        buffer_client_ids = [e["client_id"] for e in self.buffer]
-        print(f"   [ValAware-FedFa] Buffer client IDs (oldest→newest): {buffer_client_ids}")
-
-        if len(self.buffer) < self.buffer_size:
-            return
-
-        # Compute validation loss for each buffered model (on a few batches) and turn into weights.
-        # Cache val_loss inside each buffer entry so we don't recompute
-        # for unchanged models across multiple aggregations.
-        raw_weights = []
-        losses = []
-        for e in self.buffer:
-            if "val_loss" in e:
-                val_loss = e["val_loss"]
-            else:
-                # Load buffered params into the server model
-                with torch.no_grad():
-                    for name, param in self.global_model.named_parameters():
-                        param.data.copy_(e["params"][name].to(DEVICE))
-
-                # Fast approximate validation loss: only a few batches
-                self.global_model.eval()
-                criterion = nn.CrossEntropyLoss()
-                total_loss = 0.0
-                batches = 0
-                for b_idx, (images, labels) in enumerate(self.val_loader):
-                    if b_idx >= self.max_val_batches:
-                        break
-                    images, labels = images.to(DEVICE), labels.to(DEVICE)
-                    with torch.no_grad():
-                        outputs = self.global_model(images)
-                        loss = criterion(outputs, labels)
-                    total_loss += loss.item()
-                    batches += 1
-
-                val_loss = total_loss / max(1, batches)
-                e["val_loss"] = val_loss
-
-            losses.append(val_loss)
-            w_tilde = math.exp(-self.alpha * val_loss)
-            raw_weights.append(max(w_tilde, 1e-12))
-
-        Z = sum(raw_weights)
-        norm_weights = [w / Z for w in raw_weights]
-
-        # Weighted average over models in buffer
-        new_global = {}
-        for name in self.global_params.keys():
-            acc = None
-            for e, w in zip(self.buffer, norm_weights):
-                p = e["params"][name]
-                weighted = w * p
-                acc = weighted.clone() if acc is None else acc + weighted
-            new_global[name] = acc
-
         self.global_params = {name: p.clone() for name, p in new_global.items()}
         self.global_version += 1
 
@@ -643,7 +531,7 @@ print(f"\n🔧 Base Configuration:")
 print(f"   Number of clients: {num_clients}")
 print(f"   Number of async events (FedFa): {num_events}")
 print(f"   Local epochs per round/event: {local_epochs}")
-print(f"   Client learning rate (η_ell): {local_lr}")
+print(f"   Client learning rate: {local_lr}")
 print(f"   FedFa buffer size K: {buffer_size}")
 print(f"   Non-IID pattern: pathological (5 labels per client, max {MAX_LABELS} labels)")
 
@@ -694,19 +582,6 @@ print(f"Original test size: {len(test_ds_full)}, filtered test size: {len(filter
 
 test_subset = torch.utils.data.Subset(test_ds_full, filtered_test_indices)
 test_loader = DataLoader(test_subset, batch_size=512, shuffle=False)
-
-# Build a small validation set from the training data restricted to used labels
-val_indices = []
-for idx in range(len(train_ds_full)):
-    _, label = train_ds_full[idx]
-    if int(label) in all_used_labels:
-        val_indices.append(idx)
-    if len(val_indices) >= 5000:
-        break
-
-print(f"Validation set size (from train): {len(val_indices)}")
-val_subset = torch.utils.data.Subset(train_ds_full, val_indices)
-val_loader = DataLoader(val_subset, batch_size=512, shuffle=False)
 
 # ========================================
 # 🔁 FedAvg (synchronous) baseline
@@ -833,18 +708,17 @@ for rnd in range(1, rounds_fedavg + 1):
     fedavg_accuracies.append(acc)
     fedavg_losses.append(loss)
     print(f"\n📊 After FedAvg round {rnd}/{rounds_fedavg}:")
-    print(f"   Global Accuracy: {acc:.4f} ({acc*100:.2f}%), Loss: {loss:.4f}")
+    print(f"   Global Accuracy: {acc:.4f} ({acc * 100:.2f}%), Loss: {loss:.4f}")
 
 print(f"\n" + "=" * 80)
 print(f"EMNIST FEDAVG SYNCHRONOUS FEDERATED LEARNING RESULTS")
 print(f"=" * 80)
 if fedavg_accuracies:
     print(f"\n📈 Final FedAvg Performance:")
-    print(f"   Final Accuracy: {fedavg_accuracies[-1]:.4f} ({fedavg_accuracies[-1]*100:.2f}%)")
-    print(f"   Best Accuracy: {max(fedavg_accuracies):.4f} ({max(fedavg_accuracies)*100:.2f}%)")
+    print(f"   Final Accuracy: {fedavg_accuracies[-1]:.4f} ({fedavg_accuracies[-1] * 100:.2f}%)")
+    print(f"   Best Accuracy: {max(fedavg_accuracies):.4f} ({max(fedavg_accuracies) * 100:.2f}%)")
 else:
     print("\nNo FedAvg evaluation points collected.")
-
 
 # ========================================
 # 🚀 EMNIST FEDFA EXPERIMENT (ASYNC)
@@ -895,8 +769,7 @@ for event in range(1, num_events + 1):
         print(f"\n📊 After EMNIST FedFa async event {event}/{num_events}:")
         print(f"   Used client: {client.client_id}, staleness: {staleness}")
         print(f"   Current buffer size: {len(server.buffer)}")
-        print(f"   Global Accuracy: {acc:.4f} ({acc*100:.2f}%), Loss: {loss:.4f}")
-
+        print(f"   Global Accuracy: {acc:.4f} ({acc * 100:.2f}%), Loss: {loss:.4f}")
 
 print(f"\n" + "=" * 80)
 print(f"EMNIST FEDFA-STYLE FULLY ASYNC FEDERATED LEARNING RESULTS (BASELINE)")
@@ -904,11 +777,10 @@ print(f"=" * 80)
 
 if event_accuracies:
     print(f"\n📈 Final Performance (Baseline EMNIST FedFa-style):")
-    print(f"   Final Accuracy: {event_accuracies[-1]:.4f} ({event_accuracies[-1]*100:.2f}%)")
-    print(f"   Best Accuracy: {max(event_accuracies):.4f} ({max(event_accuracies)*100:.2f}%)")
+    print(f"   Final Accuracy: {event_accuracies[-1]:.4f} ({event_accuracies[-1] * 100:.2f}%)")
+    print(f"   Best Accuracy: {max(event_accuracies):.4f} ({max(event_accuracies) * 100:.2f}%)")
 else:
     print("\nNo baseline FedFa evaluation points collected.")
-
 
 # ========================================
 # 🚀 FedBuff (asynchronous) using same clients
@@ -953,13 +825,11 @@ for event in range(1, num_events + 1):
         print(f"\n📊 After FedBuff async event {event}/{num_events}:")
         print(f"   Used client: {client.client_id}")
         print(f"   Current FedBuff buffer size: {len(server_buff.buffer)}")
-        print(f"   Global Accuracy (FedBuff): {acc:.4f} ({acc*100:.2f}%), Loss: {loss:.4f}")
-
+        print(f"   Global Accuracy (FedBuff): {acc:.4f} ({acc * 100:.2f}%), Loss: {loss:.4f}")
 
 print(f"\n" + "=" * 80)
 print(f"EMNIST FEDBUFF FULLY ASYNC FEDERATED LEARNING RESULTS")
 print(f"=" * 80)
-
 
 # ========================================
 # 🚀 Participation-Fair FedFa (asynchronous)
@@ -1010,8 +880,7 @@ for event in range(1, num_events + 1):
         print(f"\n📊 After Participation-Fair FedFa async event {event}/{num_events}:")
         print(f"   Used client: {client.client_id}, staleness: {staleness}")
         print(f"   Current Participation-Fair FedFa buffer size: {len(server_pf.buffer)}")
-        print(f"   Global Accuracy (Participation-Fair FedFa): {acc:.4f} ({acc*100:.2f}%), Loss: {loss:.4f}")
-
+        print(f"   Global Accuracy (Participation-Fair FedFa): {acc:.4f} ({acc * 100:.2f}%), Loss: {loss:.4f}")
 
 print(f"\n" + "=" * 80)
 print(f"EMNIST PARTICIPATION-FAIR FEDFA FULLY ASYNC FEDERATED LEARNING RESULTS")
@@ -1027,7 +896,8 @@ global_model_fedfa_la = MLPModel(num_classes=num_classes).to(DEVICE)
 print(f"\n📊 Global Model (EMNIST Label-Aware FedFa):")
 print_model_stats(global_model_fedfa_la)
 
-server_la = FedFaServerLabelAware(global_model_fedfa_la, buffer_size=buffer_size, client_label_scores=client_label_scores)
+server_la = FedFaServerLabelAware(global_model_fedfa_la, buffer_size=buffer_size,
+                                  client_label_scores=client_label_scores)
 
 for client in clients:
     client.pull_from_server(server_la.global_params, server_la.global_version)
@@ -1062,8 +932,7 @@ for event in range(1, num_events + 1):
         print(f"\n📊 After Label-Aware FedFa async event {event}/{num_events}:")
         print(f"   Used client: {client.client_id}, staleness: {staleness}")
         print(f"   Current Label-Aware FedFa buffer size: {len(server_la.buffer)}")
-        print(f"   Global Accuracy (Label-Aware FedFa): {acc:.4f} ({acc*100:.2f}%), Loss: {loss:.4f}")
-
+        print(f"   Global Accuracy (Label-Aware FedFa): {acc:.4f} ({acc * 100:.2f}%), Loss: {loss:.4f}")
 
 print(f"\n" + "=" * 80)
 print(f"EMNIST LABEL-AWARE FEDFA FULLY ASYNC FEDERATED LEARNING RESULTS")
@@ -1071,11 +940,10 @@ print(f"=" * 80)
 
 if event_accuracies_la:
     print(f"\n📈 Final Performance (Label-Aware EMNIST FedFa):")
-    print(f"   Final Accuracy: {event_accuracies_la[-1]:.4f} ({event_accuracies_la[-1]*100:.2f}%)")
-    print(f"   Best Accuracy: {max(event_accuracies_la):.4f} ({max(event_accuracies_la)*100:.2f}%)")
+    print(f"   Final Accuracy: {event_accuracies_la[-1]:.4f} ({event_accuracies_la[-1] * 100:.2f}%)")
+    print(f"   Best Accuracy: {max(event_accuracies_la):.4f} ({max(event_accuracies_la) * 100:.2f}%)")
 else:
     print("\nNo Label-Aware FedFa evaluation points collected.")
-
 
 print("\n📊 Per-client accuracy on final global models (FedAvg vs FedFa / FedBuff / PF-FedFa / Label-Aware):")
 
@@ -1096,24 +964,24 @@ for client in clients:
     per_client_acc_pf.append(acc_pf)
     per_client_acc_la.append(acc_la)
     print(f"   Client {client.client_id}: "
-          f"FedAvg={acc_fedavg:.4f} ({acc_fedavg*100:.2f}%), "
-          f"FedFa={acc_base:.4f} ({acc_base*100:.2f}%), "
-          f"FedBuff={acc_buff:.4f} ({acc_buff*100:.2f}%), "
-          f"PF-FedFa={acc_pf:.4f} ({acc_pf*100:.2f}%), "
-          f"LabelAware-FedFa={acc_la:.4f} ({acc_la*100:.2f}%)")
+          f"FedAvg={acc_fedavg:.4f} ({acc_fedavg * 100:.2f}%), "
+          f"FedFa={acc_base:.4f} ({acc_base * 100:.2f}%), "
+          f"FedBuff={acc_buff:.4f} ({acc_buff * 100:.2f}%), "
+          f"PF-FedFa={acc_pf:.4f} ({acc_pf * 100:.2f}%), "
+          f"LabelAware-FedFa={acc_la:.4f} ({acc_la * 100:.2f}%)")
 
 if per_client_acc_fedavg:
     mean_fedavg = sum(per_client_acc_fedavg) / len(per_client_acc_fedavg)
-    print(f"\n   FedAvg mean per-client accuracy: {mean_fedavg:.4f} ({mean_fedavg*100:.2f}%)")
+    print(f"\n   FedAvg mean per-client accuracy: {mean_fedavg:.4f} ({mean_fedavg * 100:.2f}%)")
 if per_client_acc_buff:
     mean_buff = sum(per_client_acc_buff) / len(per_client_acc_buff)
-    print(f"   FedBuff mean per-client accuracy: {mean_buff:.4f} ({mean_buff*100:.2f}%)")
+    print(f"   FedBuff mean per-client accuracy: {mean_buff:.4f} ({mean_buff * 100:.2f}%)")
 if per_client_acc_pf:
     mean_pf = sum(per_client_acc_pf) / len(per_client_acc_pf)
-    print(f"   Participation-Fair FedFa mean per-client accuracy: {mean_pf:.4f} ({mean_pf*100:.2f}%)")
+    print(f"   Participation-Fair FedFa mean per-client accuracy: {mean_pf:.4f} ({mean_pf * 100:.2f}%)")
 if per_client_acc_la:
     mean_la = sum(per_client_acc_la) / len(per_client_acc_la)
-    print(f"   Label-Aware FedFa mean per-client accuracy: {mean_la:.4f} ({mean_la*100:.2f}%)")
+    print(f"   Label-Aware FedFa mean per-client accuracy: {mean_la:.4f} ({mean_la * 100:.2f}%)")
 
 
 def plot_emnist_fedfa_results():
@@ -1130,9 +998,11 @@ def plot_emnist_fedfa_results():
     if event_indices:
         ax1.plot(event_indices, event_accuracies, 'b-x', linewidth=2, markersize=6, label='FedFa (baseline) Accuracy')
     if event_indices_pf:
-        ax1.plot(event_indices_pf, event_accuracies_pf, 'y-*', linewidth=2, markersize=6, label='Participation-Fair FedFa Accuracy')
+        ax1.plot(event_indices_pf, event_accuracies_pf, 'y-*', linewidth=2, markersize=6,
+                 label='Participation-Fair FedFa Accuracy')
     if event_indices_la:
-        ax1.plot(event_indices_la, event_accuracies_la, 'g-^', linewidth=2, markersize=6, label='Label-Aware FedFa Accuracy')
+        ax1.plot(event_indices_la, event_accuracies_la, 'g-^', linewidth=2, markersize=6,
+                 label='Label-Aware FedFa Accuracy')
     ax1.set_xlabel('Async Event', fontsize=12)
     ax1.set_ylabel('Test Accuracy', fontsize=12)
     ax1.set_title('EMNIST FedFa Async FL: Accuracy vs Events', fontsize=14, fontweight='bold')
@@ -1145,7 +1015,8 @@ def plot_emnist_fedfa_results():
     if event_indices:
         ax2.plot(event_indices, event_losses, 'b-x', linewidth=2, markersize=6, label='FedFa (baseline) Loss')
     if event_indices_pf:
-        ax2.plot(event_indices_pf, event_losses_pf, 'y-*', linewidth=2, markersize=6, label='Participation-Fair FedFa Loss')
+        ax2.plot(event_indices_pf, event_losses_pf, 'y-*', linewidth=2, markersize=6,
+                 label='Participation-Fair FedFa Loss')
     if event_indices_la:
         ax2.plot(event_indices_la, event_losses_la, 'g-^', linewidth=2, markersize=6, label='Label-Aware FedFa Loss')
     ax2.set_xlabel('Async Event', fontsize=12)
@@ -1159,7 +1030,8 @@ def plot_emnist_fedfa_results():
     plt.show()
 
 
-print(f"\n📊 Creating EMNIST FedFa-Style Asynchronous Federated Learning Visualization (FedBuff vs FedFa vs PF-FedFa vs Label-Aware)...")
+print(
+    f"\n📊 Creating EMNIST FedFa-Style Asynchronous Federated Learning Visualization (FedBuff vs FedFa vs PF-FedFa vs Label-Aware)...")
 plot_emnist_fedfa_results()
 
 print(f"\n" + "=" * 80)
@@ -1196,7 +1068,6 @@ print(f"\n" + "=" * 80)
 print(f"EMNIST FEDAVG VS FEDFA COMPARISON COMPLETE!")
 print(f"=" * 80)
 
-
 # ========================================
 # 📊 Final Summary: Global Accuracies
 # ========================================
@@ -1205,14 +1076,16 @@ print("\n" + "=" * 80)
 print("EMNIST FINAL GLOBAL ACCURACY SUMMARY")
 print("=" * 80)
 
+
 def _print_final_best(name, acc_list):
     if acc_list:
         final_acc = acc_list[-1]
         best_acc = max(acc_list)
-        print(f"{name:30s} | Final: {final_acc:.4f} ({final_acc*100:.2f}%)"
-              f" | Best: {best_acc:.4f} ({best_acc*100:.2f}%)")
+        print(f"{name:30s} | Final: {final_acc:.4f} ({final_acc * 100:.2f}%)"
+              f" | Best: {best_acc:.4f} ({best_acc * 100:.2f}%)")
     else:
         print(f"{name:30s} | no evaluation points collected")
+
 
 _print_final_best("FedAvg (sync)", fedavg_accuracies)
 _print_final_best("FedBuff (async)", buff_accuracies)
@@ -1223,6 +1096,8 @@ _print_final_best("Label-Aware FedFa (async)", event_accuracies_la)
 ######### Checking actual accuracy on rare, medium, and common labels #########
 
 import numpy as np
+
+
 def plot_rarity_grouped_accuracy(model, test_loader, global_label_freq):
     """
     Groups EMNIST classes by their frequency and calculates accuracy for each group.
@@ -1232,8 +1107,8 @@ def plot_rarity_grouped_accuracy(model, test_loader, global_label_freq):
     freqs = list(global_label_freq.values())
     low_thresh = np.percentile(freqs, 20)
     high_thresh = np.percentile(freqs, 80)
-    
-    group_map = {} # label -> group_name
+
+    group_map = {}  # label -> group_name
     for label, freq in global_label_freq.items():
         if freq <= low_thresh:
             group_map[label] = "Rare Labels"
@@ -1246,7 +1121,7 @@ def plot_rarity_grouped_accuracy(model, test_loader, global_label_freq):
     model.eval()
     class_correct = defaultdict(int)
     class_total = defaultdict(int)
-    
+
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
@@ -1267,8 +1142,9 @@ def plot_rarity_grouped_accuracy(model, test_loader, global_label_freq):
     # 4. Prepare data for plotting
     names = ["Common Labels", "Medium Labels", "Rare Labels"]
     accuracies = [group_stats[n]["correct"] / max(1, group_stats[n]["total"]) for n in names]
-    
+
     return names, accuracies
+
 
 # --- Run this after your experiments ---
 # Example: Comparing Baseline FedFa vs LabelAware FedFa
@@ -1280,8 +1156,8 @@ plt.figure(figsize=(10, 6))
 x = np.arange(len(names))
 width = 0.35
 
-plt.bar(x - width/2, base_accs, width, label='Baseline FedFa', color='skyblue')
-plt.bar(x + width/2, la_accs, width, label='Label-Aware FedFa', color='orange')
+plt.bar(x - width / 2, base_accs, width, label='Baseline FedFa', color='skyblue')
+plt.bar(x + width / 2, la_accs, width, label='Label-Aware FedFa', color='orange')
 
 plt.ylabel('Accuracy')
 plt.title('Accuracy Improvement on Rare vs. Common Labels')
